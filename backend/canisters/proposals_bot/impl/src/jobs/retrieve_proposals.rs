@@ -1,6 +1,8 @@
 use crate::jobs::{push_proposals, update_proposals};
 use crate::proposals::{RawProposal, REWARD_STATUS_ACCEPT_VOTES, REWARD_STATUS_READY_TO_SETTLE};
-use crate::timer_job_types::{ProcessUserRefundJob, TimerJob, TopUpNeuronJob, VoteOnNnsProposalJob};
+use crate::timer_job_types::{
+    ProcessUserRefundJob, SubmitOCProposalForNnsProposalJob, TimerJob, TopUpNeuronJob, VoteOnNnsProposalJob,
+};
 use crate::{mutate_state, RuntimeState};
 use canister_timer_jobs::Job;
 use ic_cdk::api::call::CallResult;
@@ -9,6 +11,7 @@ use sns_governance_canister::types::ProposalData;
 use std::collections::HashSet;
 use std::time::Duration;
 use types::{CanisterId, Milliseconds, Proposal};
+use utils::consts::SNS_GOVERNANCE_CANISTER_ID;
 use utils::time::MINUTE_IN_MS;
 
 pub const NNS_TOPIC_NEURON_MANAGEMENT: i32 = 1;
@@ -129,12 +132,14 @@ fn handle_proposals_response<R: RawProposal>(governance_canister_id: CanisterId,
             }
 
             mutate_state(|state| {
+                let now = state.env.now();
+
                 if governance_canister_id == state.data.nns_governance_canister_id {
                     if let Some(neuron_id) = state.data.nns_neuron_to_vote_with {
                         for proposal in proposals.iter() {
                             if let Proposal::NNS(nns) = proposal {
                                 if NNS_TOPICS_TO_PUSH_SNS_PROPOSALS_FOR.contains(&nns.topic)
-                                    && state.data.nns_proposals_scheduled_to_vote_on.insert(nns.id)
+                                    && state.data.nns_proposals_requiring_manual_vote.insert(nns.id)
                                 {
                                     // Set up a job to reject the proposal 10 minutes before its deadline.
                                     // In parallel, we will submit an SNS proposal instructing the SNS governance
@@ -148,8 +153,26 @@ fn handle_proposals_response<R: RawProposal>(governance_canister_id: CanisterId,
                                             vote: false,
                                         }),
                                         nns.deadline.saturating_sub(10 * MINUTE_IN_MS),
-                                        state.env.now(),
+                                        now,
                                     );
+
+                                    if let Some(oc_neuron_id) = state
+                                        .data
+                                        .nervous_systems
+                                        .get_neuron_id_for_submitting_proposals(&SNS_GOVERNANCE_CANISTER_ID)
+                                    {
+                                        state.data.timer_jobs.enqueue_job(
+                                            TimerJob::SubmitOCProposalForNnsProposal(SubmitOCProposalForNnsProposalJob {
+                                                nns_proposal_id: nns.id,
+                                                nns_proposal_title: nns.title.clone(),
+                                                nns_proposal_summary: nns.summary.clone(),
+                                                nns_neuron_id: neuron_id,
+                                                oc_neuron_id,
+                                            }),
+                                            now,
+                                            now,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -184,7 +207,6 @@ fn handle_proposals_response<R: RawProposal>(governance_canister_id: CanisterId,
                     .nervous_systems
                     .take_newly_decided_user_submitted_proposals(governance_canister_id);
 
-                let now = state.env.now();
                 if let Some(ns) = state.data.nervous_systems.get(&governance_canister_id) {
                     let ledger_canister_id = ns.ledger_canister_id();
                     let amount = ns.proposal_rejection_fee().into();
